@@ -1,0 +1,23 @@
+# 忽略 PDF 与大文件（避免因超过 GitHub 100MB 限制或数十 GB 体积导致推送失败）
+*.pdf
+*.pdf.*
+*.pptx
+*.mp3
+*.part
+
+# 允许保留目录结构的占位文件
+!.gitkeep
+
+# Python 缓存与环境
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+
+# 操作系统与编辑器临时文件
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
