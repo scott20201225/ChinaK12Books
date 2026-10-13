@@ -339,15 +339,24 @@ SESSION = requests.Session()
 SESSION.headers.update(GLOBAL_HEADERS)
 
 
+TEMP_DOWNLOAD_DIR = CURRENT_DIR / ".download_temp"
+TEMP_DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+
 def download_single_book(item: Dict[str, Any], overwrite: bool = False) -> Tuple[bool, str]:
-    """下载单本教材至规范化目录（多镜像 CDN 自动回退，带魔数校验与断点安全）"""
+    """
+    下载单本教材：
+    1. 先下载至本地临时缓存 (.download_temp/)
+    2. 校验文件完整性与 %PDF 魔数
+    3. 最终剪切/移动至 ChinaK12Books 对应规范目录
+    """
     target_path = CURRENT_DIR / item["relative_path"]
     target_dir = target_path.parent
     target_dir.mkdir(parents=True, exist_ok=True)
 
     if target_path.exists() and not overwrite:
-        # 如果文件已存在且大小正常（> 100KB），直接跳过
-        if target_path.stat().st_size > 100 * 1024:
+        if target_path.stat().st_size > 50 * 1024:
+            item["status"] = "downloaded"
             return True, "已存在且版本一致 (跳过)"
 
     book_id = item["id"]
@@ -356,7 +365,6 @@ def download_single_book(item: Dict[str, Any], overwrite: bool = False) -> Tuple
     try:
         r = SESSION.get(details_url, timeout=(10, 30))
         if r.status_code != 200:
-            # 尝试备用节点
             details_url_backup = f"https://s-file-2.ykt.cbern.com.cn/zxx/ndrv2/resources/tch_material/details/{book_id}.json"
             r = SESSION.get(details_url_backup, timeout=(10, 30))
             if r.status_code != 200:
@@ -375,13 +383,14 @@ def download_single_book(item: Dict[str, Any], overwrite: bool = False) -> Tuple
         if not candidate_urls:
             return False, "无法解析下载地址"
 
-        # 开始流式下载
-        part_path = target_path.with_name(target_path.name + ".part")
+        # 1. 临时文件路径
+        temp_part = TEMP_DOWNLOAD_DIR / f"{book_id}.pdf.part"
+        temp_finished = TEMP_DOWNLOAD_DIR / f"{book_id}.pdf"
         download_success = False
 
         for url in candidate_urls:
             try:
-                with SESSION.get(url, timeout=(15, 120), stream=True) as resp:
+                with SESSION.get(url, timeout=(15, 180), stream=True) as resp:
                     if resp.status_code != 200:
                         continue
 
@@ -389,7 +398,7 @@ def download_single_book(item: Dict[str, Any], overwrite: bool = False) -> Tuple
                     first_chunk = True
                     is_valid_pdf = True
 
-                    with open(part_path, "wb") as f_out:
+                    with open(temp_part, "wb") as f_out:
                         for chunk in resp.iter_content(chunk_size=256 * 1024):
                             if not chunk:
                                 continue
@@ -401,28 +410,33 @@ def download_single_book(item: Dict[str, Any], overwrite: bool = False) -> Tuple
                             f_out.write(chunk)
                             written += len(chunk)
 
-                    if not is_valid_pdf:
-                        part_path.unlink(missing_ok=True)
+                    if not is_valid_pdf or written < 20 * 1024:
+                        temp_part.unlink(missing_ok=True)
                         continue
 
-                    # 下载完成，原子重命名
-                    part_path.replace(target_path)
+                    # 2. 临时下载完成，原子重命名为临时正式文件
+                    temp_part.replace(temp_finished)
+
+                    # 3. 最终剪切/移动到 ChinaK12Books 对应分类目录
+                    import shutil
+                    shutil.move(str(temp_finished), str(target_path))
+
                     download_success = True
                     break
             except Exception:
-                part_path.unlink(missing_ok=True)
+                temp_part.unlink(missing_ok=True)
+                temp_finished.unlink(missing_ok=True)
                 continue
 
         if download_success:
             item["status"] = "downloaded"
             item["last_synced"] = datetime.now().isoformat()
-            return True, "下载成功"
+            return True, "已剪切归档到目标目录"
         else:
             return False, "所有 CDN 镜像节点均连接失败"
 
     except Exception as e:
         return False, f"异常: {e}"
-
 
 
 def run_sync(
@@ -434,7 +448,7 @@ def run_sync(
     workers: int = 4,
     overwrite: bool = False,
 ):
-    """批量同步与下载引擎"""
+    """批量同步与下载引擎（实时显示进度并定时持久化状态）"""
     filtered = []
     for item in manifest:
         if stage_filter and stage_filter not in item["stage"]:
@@ -448,11 +462,16 @@ def run_sync(
     if limit:
         filtered = filtered[:limit]
 
-    print(f"\n🚀 开始执行教材同步任务 (总计匹配到: {len(filtered)} 本, 并发数: {workers})")
+    total_count = len(filtered)
+    print(f"\n🚀 开始执行教材下载与归档任务 (总计目标: {total_count} 本, 并发线程: {workers})")
+    print(f"📁 临时缓存路径: {TEMP_DOWNLOAD_DIR}")
+    print(f"📂 最终目标根目录: {CURRENT_DIR}\n")
 
     success_count = 0
     skip_count = 0
     fail_count = 0
+    start_time = time.time()
+    last_save_time = start_time
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
         future_to_item = {
@@ -462,25 +481,49 @@ def run_sync(
 
         for i, future in enumerate(concurrent.futures.as_completed(future_to_item), start=1):
             item = future_to_item[future]
+            pct = (i / total_count) * 100
+            size_mb = item.get("file_size", 0) / (1024 * 1024)
             try:
                 ok, reason = future.result()
                 if ok:
                     if "跳过" in reason:
                         skip_count += 1
-                        print(f"[{i}/{len(filtered)}] ⏭️ {item['filename']} -> {reason}")
+                        print(f"[{i}/{total_count}] [{pct:5.1f}%] ⏭️ {item['filename']} -> {reason}")
                     else:
                         success_count += 1
-                        print(f"[{i}/{len(filtered)}]  {item['filename']} -> {reason}")
+                        print(f"[{i}/{total_count}] [{pct:5.1f}%]  {item['filename']} ({size_mb:.1f} MB) -> {reason}")
                 else:
                     fail_count += 1
-                    print(f"[{i}/{len(filtered)}] ❌ {item['filename']} -> {reason}")
+                    print(f"[{i}/{total_count}] [{pct:5.1f}%] ❌ {item['filename']} -> {reason}")
             except Exception as e:
                 fail_count += 1
-                print(f"[{i}/{len(filtered)}] ❌ {item['filename']} 异常: {e}")
+                print(f"[{i}/{total_count}] [{pct:5.1f}%] ❌ {item['filename']} 异常: {e}")
 
-    print("\n" + "=" * 60)
-    print(f" 同步完成统计: 成功 {success_count} 本 | 跳过 {skip_count} 本 | 失败 {fail_count} 本")
-    print("=" * 60)
+            # 每 10 本或每隔 15 秒持久化一次 manifest.json
+            now = time.time()
+            if i % 10 == 0 or (now - last_save_time > 15):
+                try:
+                    with open(MANIFEST_JSON, "w", encoding="utf-8") as f_save:
+                        json.dump(manifest, f_save, ensure_ascii=False, indent=2)
+                    last_save_time = now
+                except Exception:
+                    pass
+
+    # 任务全部完成，最终保存一次
+    try:
+        with open(MANIFEST_JSON, "w", encoding="utf-8") as f_save:
+            json.dump(manifest, f_save, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+    elapsed = time.time() - start_time
+    print("\n" + "=" * 65)
+    print(f"🎉 批量下载归档完成！耗时: {elapsed:.1f} 秒")
+    print(f"   • 新增下载并归档: {success_count} 本")
+    print(f"   • 版本一致已跳过: {skip_count} 本")
+    print(f"   • 失败待重试:     {fail_count} 本")
+    print("=" * 65 + "\n")
+
 
 
 def create_directory_structure(manifest: List[Dict[str, Any]]):

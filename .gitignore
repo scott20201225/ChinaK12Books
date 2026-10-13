@@ -4,6 +4,7 @@
 *.pptx
 *.mp3
 *.part
+.download_temp/
 
 # 允许保留目录结构的占位文件
 !.gitkeep
